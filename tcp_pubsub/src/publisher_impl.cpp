@@ -74,12 +74,14 @@ namespace tcp_pubsub
 
     // set up the acceptor to listen on the tcp port
     asio::error_code make_address_ec;
-    const asio::ip::tcp::endpoint endpoint(asio::ip::make_address(address, make_address_ec), port);
+    const asio::ip::tcp::endpoint requested_endpoint(asio::ip::make_address(address, make_address_ec), port);
     if (make_address_ec)
     {
       log_(logger::LogLevel::Error,  "Publisher: Error parsing address \"" + address + ":" + std::to_string(port) + "\": " + make_address_ec.message());
       return false;
     }
+
+    asio::ip::tcp::endpoint endpoint = requested_endpoint;
     
 #if (TCP_PUBSUB_LOG_DEBUG_VERBOSE_ENABLED)
     log_(logger::LogLevel::DebugVerbose, "Publisher " + toString(endpoint) + ": Opening acceptor.");
@@ -90,8 +92,26 @@ namespace tcp_pubsub
       acceptor_.open(endpoint.protocol(), ec);
       if (ec)
       {
-        log_(logger::LogLevel::Error, "Publisher " + toString(endpoint) + ": Error opening acceptor: " + ec.message());
-        return false;
+        const bool can_fallback_to_ipv4 = requested_endpoint.address().is_v6()
+                                           && requested_endpoint.address().to_v6().is_unspecified()
+                                           && (ec == asio::error::address_family_not_supported
+                                               || ec == asio::error::operation_not_supported);
+
+        if (can_fallback_to_ipv4)
+        {
+          endpoint = asio::ip::tcp::endpoint(asio::ip::address_v4::any(), port);
+          log_(logger::LogLevel::Warning,
+               "Publisher " + toString(requested_endpoint)
+               + ": IPv6 not supported, falling back to IPv4 endpoint " + toString(endpoint) + ".");
+
+          acceptor_.open(endpoint.protocol(), ec);
+        }
+
+        if (ec)
+        {
+          log_(logger::LogLevel::Error, "Publisher " + toString(requested_endpoint) + ": Error opening acceptor: " + ec.message());
+          return false;
+        }
       }
     }
 
