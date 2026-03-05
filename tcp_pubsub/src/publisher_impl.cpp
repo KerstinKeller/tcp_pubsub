@@ -74,14 +74,12 @@ namespace tcp_pubsub
 
     // set up the acceptor to listen on the tcp port
     asio::error_code make_address_ec;
-    const asio::ip::tcp::endpoint requested_endpoint(asio::ip::make_address(address, make_address_ec), port);
+    asio::ip::tcp::endpoint endpoint(asio::ip::make_address(address, make_address_ec), port);
     if (make_address_ec)
     {
       log_(logger::LogLevel::Error,  "Publisher: Error parsing address \"" + address + ":" + std::to_string(port) + "\": " + make_address_ec.message());
       return false;
     }
-
-    asio::ip::tcp::endpoint endpoint = requested_endpoint;
     
 #if (TCP_PUBSUB_LOG_DEBUG_VERBOSE_ENABLED)
     log_(logger::LogLevel::DebugVerbose, "Publisher " + toString(endpoint) + ": Opening acceptor.");
@@ -92,24 +90,45 @@ namespace tcp_pubsub
       acceptor_.open(endpoint.protocol(), ec);
       if (ec)
       {
-        const bool can_fallback_to_ipv4 = requested_endpoint.address().is_v6()
-                                           && requested_endpoint.address().to_v6().is_unspecified()
-                                           && (ec == asio::error::address_family_not_supported
-                                               || ec == asio::error::operation_not_supported);
-
-        if (can_fallback_to_ipv4)
+        if ((ec == asio::error::address_family_not_supported || ec == asio::error::operation_not_supported)
+          && endpoint.address().is_v6()
+          && endpoint.address().to_v6().is_v4_mapped())
         {
-          endpoint = asio::ip::tcp::endpoint(asio::ip::address_v4::any(), port);
-          log_(logger::LogLevel::Warning,
-               "Publisher " + toString(requested_endpoint)
-               + ": IPv6 not supported, falling back to IPv4 endpoint " + toString(endpoint) + ".");
+          // The error is v6 related and we can downgrade to IPv4, so let's try that
+          log_(logger::LogLevel::Warning, "Publisher " + toString(endpoint) + ": Error opening acceptor with IPv6 address: " + ec.message() + ". Trying to fall-back to IPv4.");
 
-          acceptor_.open(endpoint.protocol(), ec);
+          // Try convert v6 address to v4
+          asio::ip::address_v4 new_address;
+          try
+          {
+            new_address = asio::ip::make_address_v4(asio::ip::v4_mapped, endpoint.address().to_v6());
+          }
+          catch (const std::exception& e)
+          {
+            log_(logger::LogLevel::Error, "Publisher " + toString(endpoint) + ": Error downgrading IPv6 address " + endpoint.address().to_v6().to_string() + " to IPv4: " + e.what());
+            return false;
+          }
+
+          // Try to open the acceptor with the new v4 address
+          asio::ip::tcp::endpoint new_endpoint(new_address, port);
+          {
+            asio::error_code reopen_ec;
+            acceptor_.open(new_endpoint.protocol(), reopen_ec);
+            if (reopen_ec)
+            {
+              log_(logger::LogLevel::Error, "Publisher " + toString(endpoint) + ": Error opening acceptor with fallback IPv4 address " + new_endpoint.address().to_string() + ": " + reopen_ec.message());
+              return false;
+            }
+          }
+
+          // Success! Log the fallback and continue with the new endpoint
+          log_(logger::LogLevel::Warning, "Publisher " + toString(endpoint) + ": Successfully opened acceptor with fallback IPv4 address " + new_endpoint.address().to_string() + ". Continuing with the fallback address.");
+          endpoint = new_endpoint;
         }
-
-        if (ec)
+        else
         {
-          log_(logger::LogLevel::Error, "Publisher " + toString(requested_endpoint) + ": Error opening acceptor: " + ec.message());
+          // Exit, as the error is not v6 related or we cannot downgrade to IPv4
+          log_(logger::LogLevel::Error, "Publisher " + toString(endpoint) + ": Error opening acceptor: " + ec.message());
           return false;
         }
       }
